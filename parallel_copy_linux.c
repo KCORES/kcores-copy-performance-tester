@@ -10,14 +10,19 @@
 #include <pthread.h>
 #include <errno.h>
 #include <stdint.h>
+#include <ctype.h>
+#include <stdbool.h>
+#include <libgen.h>
 
 // Define copy mode enum
 typedef enum {
     SYSTEM_CP,
     MMAP,
     DIRECT_IO,
-    DIRECT_IO_MEMORY_IMPACT
+    DIRECT_IO_MEMORY_IMPACT,
+    GENERATE_TEST_FILES
 } CopyMode;
+
 
 // Define file copy task structure
 typedef struct {
@@ -141,16 +146,10 @@ static int copy_using_direct_io_memory_impact(const char *src, const char *dst, 
         return -1;
     }
 
-    // Use linear congruential generator to fill source buffer with random data
-    uint64_t *src_ptr = (uint64_t *)src_buffer;
-    uint64_t random_value = 0x0123456789ABCDEF;  // Initial seed
-    const uint64_t multiplier = 6364136223846793005ULL;
-    const uint64_t increment = 1;
-    
-    for (size_t i = 0; i < MAX_READ_SIZE / sizeof(uint64_t); i++) {
-        random_value = random_value * multiplier + increment;
-        src_ptr[i] = random_value;
-    }
+    // Replace original random data generation code
+    RandomGenerator gen;
+    init_random_generator(&gen);
+    fill_buffer_with_random_data(&gen, src_buffer, MAX_READ_SIZE);
 
     // Force memory barrier to ensure initialization is complete
     __sync_synchronize();
@@ -235,27 +234,261 @@ void* copy_file_thread(void *arg) {
     return NULL;
 }
 
-int main(int argc, char *argv[]) {
-    if (argc < 4) {
-        printf("Usage: %s --mode [cp|mmap|direct_io|direct_io_memory_impact] --from file1 [file2 ...] --to dest_dir\n", argv[0]);
+// Parse file size string
+static uint64_t parse_size(const char *size_str) {
+    uint64_t size;
+    char unit;
+    if (sscanf(size_str, "%lu%c", &size, &unit) != 2) {
+        return 0;
+    }
+    
+    switch (toupper(unit)) {
+        case 'T':
+            size *= 1024;
+        case 'G':
+            size *= 1024;
+        case 'M':
+            size *= 1024 * 1024;
+            break;
+        default:
+            return 0;
+    }
+    
+    return size;
+}
+
+// Add random number generator structure and functions
+typedef struct {
+    uint64_t seed;
+    uint64_t multiplier;
+    uint64_t increment;
+} RandomGenerator;
+
+static void init_random_generator(RandomGenerator *gen) {
+    gen->seed = 0x0123456789ABCDEF;  // Initial seed
+    gen->multiplier = 6364136223846793005ULL;
+    gen->increment = 1;
+}
+
+static void fill_buffer_with_random_data(RandomGenerator *gen, void *buffer, size_t size) {
+    uint64_t *ptr = (uint64_t *)buffer;
+    size_t num_elements = size / sizeof(uint64_t);
+    
+    for (size_t i = 0; i < num_elements; i++) {
+        gen->seed = gen->seed * gen->multiplier + gen->increment;
+        ptr[i] = gen->seed;
+    }
+    
+    // Force memory barrier to ensure initialization is complete
+    __sync_synchronize();
+}
+
+// Generate test file
+static int generate_test_file(const char *path, uint64_t size) {
+    int fd;
+    void *buf = NULL;
+    const size_t buf_size = 1024 * 1024; // 1MB buffer
+    uint64_t remaining = size;
+    
+    // Use O_DIRECT for better performance
+    fd = open(path, O_WRONLY | O_CREAT | O_DIRECT, 0644);
+    if (fd < 0) {
+        // If O_DIRECT fails, try without it
+        fd = open(path, O_WRONLY | O_CREAT, 0644);
+        if (fd < 0) {
+            perror("open");
+            return -1;
+        }
+    }
+    
+    // Allocate aligned memory
+    if (posix_memalign(&buf, 512, buf_size)) {
+        close(fd);
+        return -1;
+    }
+    
+    // Replace original random data generation code
+    RandomGenerator gen;
+    init_random_generator(&gen);
+    fill_buffer_with_random_data(&gen, buf, buf_size);
+    
+    // Write to file
+    while (remaining > 0) {
+        size_t to_write = (remaining < buf_size) ? remaining : buf_size;
+        // Ensure write size is multiple of 512 (for O_DIRECT)
+        to_write = (to_write / 512) * 512;
+        
+        ssize_t written = write(fd, buf, to_write);
+        if (written < 0) {
+            perror("write");
+            free(buf);
+            close(fd);
+            return -1;
+        }
+        remaining -= written;
+    }
+    
+    // Cleanup
+    free(buf);
+    if (fsync(fd) < 0) {
+        perror("fsync");
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+// Thread function for generating test files
+typedef struct {
+    char *path;
+    uint64_t size;
+    int index;
+    double duration;
+} GenerateTask;
+
+void* generate_file_thread(void *arg) {
+    GenerateTask *task = (GenerateTask *)arg;
+    struct timeval start, end;
+    
+    gettimeofday(&start, NULL);
+    int result = generate_test_file(task->path, task->size);
+    gettimeofday(&end, NULL);
+    
+    task->duration = (end.tv_sec - start.tv_sec) + 
+                    (end.tv_usec - start.tv_usec) / 1000000.0;
+    
+    return (void*)(long)result;
+}
+
+// New function: handle generate test files mode
+static int handle_generate_test_files(int argc, char *argv[]) {
+    if (argc < 7) {
+        printf("Missing parameters for generate_test_files mode\n");
         return 1;
     }
-
-    // Parse command line arguments...
-    // Simplified example assumes fixed argument format
-
-    CopyMode mode;
-    if (strcmp(argv[2], "cp") == 0) mode = SYSTEM_CP;
-    else if (strcmp(argv[2], "mmap") == 0) mode = MMAP;
-    else if (strcmp(argv[2], "direct_io") == 0) mode = DIRECT_IO;
-    else if (strcmp(argv[2], "direct_io_memory_impact") == 0) mode = DIRECT_IO_MEMORY_IMPACT;
-    else {
-        printf("Invalid mode\n");
+    
+    uint64_t file_size = 0;
+    int num_files = 0;
+    char *output_dir = ".";  // Default to current directory
+    
+    // Parse arguments
+    for (int i = 3; i < argc; i += 2) {
+        if (strcmp(argv[i], "--size") == 0) {
+            file_size = parse_size(argv[i+1]);
+        } else if (strcmp(argv[i], "--num") == 0) {
+            num_files = atoi(argv[i+1]);
+        } else if (strcmp(argv[i], "--dir") == 0) {
+            output_dir = argv[i+1];
+        }
+    }
+    
+    if (file_size == 0 || num_files <= 0) {
+        printf("Invalid size or number of files\n");
         return 1;
     }
+    
+    // Create and execute generation tasks
+    GenerateTask *tasks = malloc(sizeof(GenerateTask) * num_files);
+    pthread_t *threads = malloc(sizeof(pthread_t) * num_files);
+    
+    printf("Generating %d test files of size %luB each in %s\n", 
+           num_files, file_size, output_dir);
+    
+    for (int i = 0; i < num_files; i++) {
+        tasks[i].path = malloc(strlen(output_dir) + 32);
+        sprintf(tasks[i].path, "%s/test_file_%d", output_dir, i + 1);
+        tasks[i].size = file_size;
+        tasks[i].index = i;
+        
+        pthread_create(&threads[i], NULL, generate_file_thread, &tasks[i]);
+    }
+    
+    // Wait for all threads to complete
+    bool all_success = true;
+    for (int i = 0; i < num_files; i++) {
+        void *thread_result;
+        pthread_join(threads[i], &thread_result);
+        if ((long)thread_result != 0) {
+            all_success = false;
+        }
+    }
+    
+    // Print results
+    printf("\nGeneration Results:\n");
+    printf("%-10s %-30s %-15s %-12s\n", 
+           "File #", "Path", "Size", "Duration (s)");
+    printf("------------------------------------------------------------\n");
+    
+    double total_duration = 0;
+    for (int i = 0; i < num_files; i++) {
+        printf("%-10d %-30s %-15lu %11.2f\n",
+               i + 1, tasks[i].path, file_size, tasks[i].duration);
+        total_duration = (tasks[i].duration > total_duration) ? 
+                        tasks[i].duration : total_duration;
+    }
+    
+    printf("\nTotal Statistics:\n");
+    printf("Total Size: %.2f GiB\n", 
+           (file_size * num_files) / (1024.0 * 1024.0 * 1024.0));
+    printf("Total Duration: %.2f seconds\n", total_duration);
+    printf("Average Speed: %.2f MiB/s\n", 
+           (file_size * num_files) / (1024.0 * 1024.0) / total_duration);
+    
+    // Cleanup resources
+    for (int i = 0; i < num_files; i++) {
+        free(tasks[i].path);
+    }
+    free(tasks);
+    free(threads);
+    
+    return all_success ? 0 : 1;
+}
 
-    // Create and execute copy tasks
-    int num_files = (argc - 6);  // Subtract fixed argument count
+// Print usage information
+static void print_usage(const char *program_name) {
+    printf("Usage:\n");
+    printf("  Copy files:\n");
+    printf("    %s --mode [cp|mmap|direct_io|direct_io_memory_impact] --from file1 [file2 ...] --to dest_dir\n", program_name);
+    printf("  Generate test files:\n");
+    printf("    %s --mode generate_test_files --size <size>[M|G|T] --num <number> [--dir <output_dir>]\n", program_name);
+}
+
+// Parse copy mode from command line argument
+static CopyMode parse_copy_mode(const char *mode_str) {
+    if (strcmp(mode_str, "cp") == 0) return SYSTEM_CP;
+    if (strcmp(mode_str, "mmap") == 0) return MMAP;
+    if (strcmp(mode_str, "direct_io") == 0) return DIRECT_IO;
+    if (strcmp(mode_str, "direct_io_memory_impact") == 0) return DIRECT_IO_MEMORY_IMPACT;
+    return -1;
+}
+
+// Print copy results
+static void print_copy_results(CopyTask *tasks, int num_files) {
+    printf("\nDetailed Results:\n");
+    printf("%-10s %-30s %-12s %-12s %-12s\n", 
+           "Thread ID", "Filename", "Size (MiB)", "Duration (s)", "Speed (MiB/s)");
+    printf("--------------------------------------------------------------------------------\n");
+
+    double total_size = 0, total_duration = 0;
+    for (int i = 0; i < num_files; i++) {
+        printf("%-10d %-30s %11.2f %11.2f %11.2f\n", 
+               i, basename(tasks[i].src_path), 
+               tasks[i].size_mib, tasks[i].duration, tasks[i].speed);
+        total_size += tasks[i].size_mib;
+        total_duration = (tasks[i].duration > total_duration) ? 
+                        tasks[i].duration : total_duration;
+    }
+
+    printf("\nTotal Statistics:\n");
+    printf("Total Size: %.2f MiB\n", total_size);
+    printf("Total Duration: %.2f seconds\n", total_duration);
+    printf("Average Speed: %.2f MiB/s\n", total_size / total_duration);
+}
+
+// Handle file copy mode
+static int handle_copy_files(int argc, char *argv[], CopyMode mode) {
+    int num_files = (argc - 6);
     CopyTask *tasks = malloc(sizeof(CopyTask) * num_files);
     pthread_t *threads = malloc(sizeof(pthread_t) * num_files);
 
@@ -269,34 +502,14 @@ int main(int argc, char *argv[]) {
         pthread_create(&threads[i], NULL, copy_file_thread, &tasks[i]);
     }
 
-    // Wait for all threads to complete
+    // Wait for completion
     for (int i = 0; i < num_files; i++) {
         pthread_join(threads[i], NULL);
     }
 
-    // Print results
-    printf("\nDetailed Results:\n");
-    printf("%-10s %-30s %-12s %-12s %-12s\n", "Thread ID", "Filename", "Size (MiB)", "Duration (s)", "Speed (MiB/s)");
-    printf("--------------------------------------------------------------------------------\n");
+    // Print results and cleanup
+    print_copy_results(tasks, num_files);
 
-    double total_size = 0, total_duration = 0;
-    for (int i = 0; i < num_files; i++) {
-        printf("%-10d %-30s %11.2f %11.2f %11.2f\n", 
-               i,  // Thread ID
-               basename(tasks[i].src_path), 
-               tasks[i].size_mib, 
-               tasks[i].duration, 
-               tasks[i].speed);
-        total_size += tasks[i].size_mib;
-        total_duration = (tasks[i].duration > total_duration) ? tasks[i].duration : total_duration;
-    }
-
-    printf("\nTotal Statistics:\n");
-    printf("Total Size: %.2f MiB\n", total_size);
-    printf("Total Duration: %.2f seconds\n", total_duration);
-    printf("Average Speed: %.2f MiB/s\n", total_size / total_duration);
-
-    // Cleanup resources
     for (int i = 0; i < num_files; i++) {
         free(tasks[i].dst_path);
     }
@@ -304,4 +517,25 @@ int main(int argc, char *argv[]) {
     free(threads);
 
     return 0;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 3) {
+        print_usage(argv[0]);
+        return 1;
+    }
+
+    // Handle generate test files mode
+    if (strcmp(argv[2], "generate_test_files") == 0) {
+        return handle_generate_test_files(argc, argv);
+    }
+    
+    // Handle copy mode
+    CopyMode mode = parse_copy_mode(argv[2]);
+    if (mode == -1) {
+        printf("Invalid mode\n");
+        return 1;
+    }
+
+    return handle_copy_files(argc, argv, mode);
 }
