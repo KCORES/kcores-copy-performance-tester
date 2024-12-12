@@ -11,7 +11,11 @@ if(MSVC)
 endif()
 
 # 添加可执行文件
-add_executable(parallel_copy parallel_copy.c)
+if(WIN32)
+    add_executable(parallel_copy parallel_copy_windows.c)
+else()
+    add_executable(parallel_copy parallel_copy_linux.c)
+endif()
 
 # Windows 特定设置
 if(WIN32)
