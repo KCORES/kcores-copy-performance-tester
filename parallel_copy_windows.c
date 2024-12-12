@@ -213,9 +213,81 @@ static int copy_using_direct_io(const wchar_t *src, const wchar_t *dst, size_t f
 
 // Memory impact copy function (simulated)
 static int copy_using_direct_io_memory_impact(const wchar_t *src, const wchar_t *dst, size_t file_size) {
-    // This function can simulate memory impact using similar logic to direct I/O
-    // For simplicity, we will use the same logic as direct I/O here
-    return copy_using_direct_io(src, dst, file_size);
+    // Get Windows system page size
+    SYSTEM_INFO sys_info;
+    GetSystemInfo(&sys_info);
+    const size_t page_size = sys_info.dwPageSize;
+    
+    // Use 2MB as DMA transfer block size (same as Linux version)
+    const size_t dma_block_size = 2 * 1024 * 1024;  // 2MB
+    
+    // Allocate page-aligned memory using Windows API
+    void *src_buffer = VirtualAlloc(NULL, MAX_READ_SIZE, 
+                                  MEM_COMMIT | MEM_RESERVE, 
+                                  PAGE_READWRITE);
+    void *dst_buffer = VirtualAlloc(NULL, MAX_READ_SIZE, 
+                                  MEM_COMMIT | MEM_RESERVE, 
+                                  PAGE_READWRITE);
+    
+    if (!src_buffer || !dst_buffer) {
+        if (src_buffer) VirtualFree(src_buffer, 0, MEM_RELEASE);
+        if (dst_buffer) VirtualFree(dst_buffer, 0, MEM_RELEASE);
+        return GetLastError();
+    }
+
+    // Generate random data
+    RandomGenerator gen;
+    init_random_generator(&gen);
+    fill_buffer_with_random_data(&gen, src_buffer, MAX_READ_SIZE);
+
+    // Force memory barrier using Windows API
+    MemoryBarrier();
+
+    // Simulate DMA transfer process
+    size_t remaining = file_size;
+    char *current_src = (char *)src_buffer;
+    char *current_dst = (char *)dst_buffer;
+    volatile UINT64 checksum = 0;
+
+    while (remaining > 0) {
+        size_t current_chunk = (remaining < MAX_READ_SIZE) ? remaining : MAX_READ_SIZE;
+        size_t chunk_remaining = current_chunk;
+        
+        char *chunk_src = current_src;
+        char *chunk_dst = current_dst;
+        
+        // Transfer by DMA block size
+        while (chunk_remaining >= dma_block_size) {
+            chunk_dst = (char *)memcpy(chunk_dst, chunk_src, dma_block_size) + dma_block_size;
+            chunk_src += dma_block_size;
+            chunk_remaining -= dma_block_size;
+            
+            // Verify after each DMA block transfer
+            for (size_t i = 0; i < dma_block_size; i += page_size) {
+                checksum ^= *(volatile UINT64 *)(chunk_dst - dma_block_size + i);
+            }
+        }
+        
+        // Handle remaining bytes
+        if (chunk_remaining > 0) {
+            // Ensure remaining portion is page-aligned
+            size_t aligned_remaining = (chunk_remaining + page_size - 1) & ~(page_size - 1);
+            chunk_dst = (char *)memcpy(chunk_dst, chunk_src, aligned_remaining) + aligned_remaining;
+            
+            // Verify remaining portion
+            for (size_t i = 0; i < aligned_remaining; i += page_size) {
+                checksum ^= *(volatile UINT64 *)(chunk_dst - aligned_remaining + i);
+            }
+        }
+        
+        remaining -= current_chunk;
+    }
+
+    // Cleanup
+    VirtualFree(src_buffer, 0, MEM_RELEASE);
+    VirtualFree(dst_buffer, 0, MEM_RELEASE);
+    
+    return (checksum != 0) ? 0 : GetLastError();
 }
 
 // Generate test file function
@@ -342,13 +414,78 @@ static int handle_benchmark(int argc, wchar_t *argv[]) {
     }
     
     if (file_size == 0 || num_files <= 0 || !from_dir || !to_dir) {
-        wprintf(L"Invalid parameters for benchmark mode\n");
+        wprintf(L"Invalid parameters for benchmark mode:\n");
+        if (file_size == 0) {
+            wprintf(L"  - File size must be greater than 0\n");
+        }
+        if (num_files <= 0) {
+            wprintf(L"  - Number of files must be greater than 0\n");
+        }
+        if (!from_dir) {
+            wprintf(L"  - Source directory (--from) is required\n");
+        }
+        if (!to_dir) {
+            wprintf(L"  - Destination directory (--to) is required\n");
+        }
+        wprintf(L"\nUsage: --mode benchmark --size <size> --num <number> --from <source_dir> --to <dest_dir>\n");
         return 1;
     }
 
     // Generate test files first
     wprintf(L"Generating test files...\n");
-    // ... (similar logic to generate test files as in Linux version) ...
+    CopyTask *gen_tasks = malloc(sizeof(CopyTask) * num_files);
+    HANDLE *gen_threads = malloc(sizeof(HANDLE) * num_files);
+    
+    for (int i = 0; i < num_files; i++) {
+        gen_tasks[i].src_path = malloc(sizeof(wchar_t) * (wcslen(from_dir) + 32));
+        swprintf(gen_tasks[i].src_path, wcslen(from_dir) + 32, L"%s\\test_file_%d", from_dir, i + 1);
+        gen_tasks[i].mode = GENERATE_TEST_FILES;
+        gen_tasks[i].test_file_size = file_size;
+        
+        gen_threads[i] = CreateThread(
+            NULL,                   // 默认安全属性
+            0,                      // 默认堆栈大小
+            copy_file_thread,       // 线程函数
+            &gen_tasks[i],         // 线程函数参数
+            0,                      // 默认创建标志
+            NULL                    // 不接收线程ID
+        );
+
+        if (gen_threads[i] == NULL) {
+            wprintf(L"Failed to create generation thread %d\n", i);
+            // 清理已创建的线程和资源
+            for (int j = 0; j < i; j++) {
+                CloseHandle(gen_threads[j]);
+                free(gen_tasks[j].src_path);
+            }
+            free(gen_tasks);
+            free(gen_threads);
+            return 1;
+        }
+    }
+    
+    // 等待所有生成线程完成
+    bool all_success = true;
+    for (int i = 0; i < num_files; i++) {
+        DWORD result;
+        WaitForSingleObject(gen_threads[i], INFINITE);
+        GetExitCodeThread(gen_threads[i], &result);
+        if (result != 0) {
+            all_success = false;
+            wprintf(L"Failed to generate test file %d\n", i + 1);
+        }
+        CloseHandle(gen_threads[i]);
+    }
+
+    if (!all_success) {
+        // 清理资源并返回错误
+        for (int i = 0; i < num_files; i++) {
+            free(gen_tasks[i].src_path);
+        }
+        free(gen_tasks);
+        free(gen_threads);
+        return 1;
+    }
 
     // Prepare benchmark results array
     BenchmarkResult *results = malloc(sizeof(BenchmarkResult) * num_files);
@@ -614,26 +751,39 @@ static int handle_copy_files(int argc, wchar_t *argv[], CopyMode mode) {
     wchar_t **src_files = NULL;
     wchar_t *dst_dir = NULL;
     int num_files = 0;
-    bool found_from = false;
+    int from_index = -1;
+    int to_index = -1;
 
+    // 首先找到 --from 和 --to 的位置
     for (int i = 3; i < argc; i++) {
         if (wcscmp(argv[i], L"--from") == 0) {
-            found_from = true;
-            src_files = &argv[i + 1];
-            continue;
-        }
-        if (wcscmp(argv[i], L"--to") == 0) {
-            dst_dir = argv[i + 1];
-            if (found_from) {
-                num_files = (i - 1) - (src_files - argv);
-            }
+            from_index = i;
+        } else if (wcscmp(argv[i], L"--to") == 0) {
+            to_index = i;
             break;
         }
     }
 
-    if (!src_files || !dst_dir || num_files <= 0) {
+    // 验证参数
+    if (from_index == -1 || to_index == -1 || from_index >= to_index) {
         wprintf(L"Invalid parameters for copy mode\n");
         return 1;
+    }
+
+    // 计算文件数量和设置源文件数组
+    src_files = &argv[from_index + 1];
+    num_files = to_index - (from_index + 1);
+    dst_dir = argv[to_index + 1];
+
+    if (num_files <= 0) {
+        wprintf(L"No source files specified\n");
+        return 1;
+    }
+
+    // 打印调试信息
+    wprintf(L"Number of files to copy: %d\n", num_files);
+    for (int i = 0; i < num_files; i++) {
+        wprintf(L"File %d: %s\n", i + 1, src_files[i]);
     }
 
     // 创建任务和线程

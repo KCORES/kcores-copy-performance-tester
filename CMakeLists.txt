@@ -20,6 +20,9 @@ endif()
 # Windows 特定设置
 if(WIN32)
     target_compile_definitions(parallel_copy PRIVATE _WIN32)
+    # 添加静态链接设置
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Release>:>")
+    target_compile_options(parallel_copy PRIVATE /MT)
 else()
     find_package(Threads REQUIRED)
     target_link_libraries(parallel_copy PRIVATE Threads::Threads)
