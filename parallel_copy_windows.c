@@ -144,13 +144,13 @@ static int copy_using_mmap(const wchar_t *src, const wchar_t *dst, size_t file_s
             FILE_MAP_READ,
             (DWORD)(offset >> 32),
             (DWORD)offset,
-            (DWORD)chunk_size);
+            (chunk_size > MAXDWORD) ? MAXDWORD : (DWORD)chunk_size);
 
         LPVOID dst_view = MapViewOfFile(dst_map,
             FILE_MAP_WRITE,
             (DWORD)(offset >> 32),
             (DWORD)offset,
-            (DWORD)chunk_size);
+            (chunk_size > MAXDWORD) ? MAXDWORD : (DWORD)chunk_size);
 
         if (src_view == NULL || dst_view == NULL) {
             result = GetLastError();
@@ -197,8 +197,9 @@ static int copy_using_direct_io(const wchar_t *src, const wchar_t *dst, size_t f
     while (remaining > 0) {
         size_t to_read = (remaining < MAX_READ_SIZE) ? remaining : MAX_READ_SIZE;
         to_read = (to_read / BLOCK_SIZE) * BLOCK_SIZE;  // Align to block size
+        DWORD bytes_to_read = (to_read > MAXDWORD) ? MAXDWORD : (DWORD)to_read;  // 显式转换为 DWORD
 
-        if (!ReadFile(src_handle, buffer, (DWORD)to_read, &bytes_read, NULL) || bytes_read == 0) break;
+        if (!ReadFile(src_handle, buffer, bytes_to_read, &bytes_read, NULL) || bytes_read == 0) break;
         if (!WriteFile(dst_handle, buffer, bytes_read, &bytes_written, NULL) || bytes_written != bytes_read) break;
 
         remaining -= bytes_read;
@@ -237,7 +238,7 @@ static int generate_test_file(const wchar_t *path, uint64_t size) {
     DWORD bytes_written;
     uint64_t remaining = size;
     while (remaining > 0) {
-        size_t to_write = (remaining < 512) ? remaining : 512;
+        DWORD to_write = (remaining < 512) ? (DWORD)remaining : 512;  // 显式转换为 DWORD
         if (!WriteFile(file_handle, buffer, to_write, &bytes_written, NULL) || bytes_written != to_write) {
             _aligned_free(buffer);
             CloseHandle(file_handle);
@@ -355,8 +356,22 @@ static int handle_benchmark(int argc, wchar_t *argv[]) {
     // Run memory impact tests using existing function
     wprintf(L"\nRunning memory copy tests...\n");
     for (int i = 0; i < num_files; i++) {
-        CopyTask task;
-        // ... (initialize task and run copy_file_thread) ...
+        CopyTask task = {0};  // 初始化为0
+        wchar_t src_path[MAX_PATH];
+        wchar_t dst_path[MAX_PATH];
+        
+        swprintf(src_path, MAX_PATH, L"%s\\test_file_%d", from_dir, i + 1);
+        swprintf(dst_path, MAX_PATH, L"%s\\test_file_%d", to_dir, i + 1);
+        
+        task.src_path = src_path;
+        task.dst_path = dst_path;
+        task.mode = DIRECT_IO_MEMORY_IMPACT;
+        
+        HANDLE thread = CreateThread(NULL, 0, copy_file_thread, &task, 0, NULL);
+        if (thread) {
+            WaitForSingleObject(thread, INFINITE);
+            CloseHandle(thread);
+        }
 
         results[i].filename = _wcsdup(task.src_path);
         results[i].size_mib = task.size_mib;
@@ -367,8 +382,22 @@ static int handle_benchmark(int argc, wchar_t *argv[]) {
     // Run disk copy tests using direct_io mode
     wprintf(L"\nRunning disk copy tests...\n");
     for (int i = 0; i < num_files; i++) {
-        CopyTask task;
-        // ... (initialize task and run copy_file_thread) ...
+        CopyTask task = {0};  // 初始化为0
+        wchar_t src_path[MAX_PATH];
+        wchar_t dst_path[MAX_PATH];
+        
+        swprintf(src_path, MAX_PATH, L"%s\\test_file_%d", from_dir, i + 1);
+        swprintf(dst_path, MAX_PATH, L"%s\\test_file_%d_disk", to_dir, i + 1);
+        
+        task.src_path = src_path;
+        task.dst_path = dst_path;
+        task.mode = DIRECT_IO;
+        
+        HANDLE thread = CreateThread(NULL, 0, copy_file_thread, &task, 0, NULL);
+        if (thread) {
+            WaitForSingleObject(thread, INFINITE);
+            CloseHandle(thread);
+        }
 
         results[i].disk_duration = task.duration;
         results[i].disk_speed = task.speed;
@@ -451,7 +480,7 @@ static int handle_generate_test_files(int argc, wchar_t *argv[]) {
                     return 0;
             }
         } else if (wcscmp(argv[i], L"--num") == 0) {
-            num_files = _wtoi(argv[i+1]);
+            num_files = (int)wcstol(argv[i+1], NULL, 10);  // 使用 wcstol 替代 _wtoi
         } else if (wcscmp(argv[i], L"--dir") == 0) {
             output_dir = argv[i+1];
         }
