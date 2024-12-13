@@ -18,13 +18,13 @@ typedef enum {
 
 // Define file copy task structure
 typedef struct {
-    wchar_t *src_path;  // 使用宽字符以支持Unicode
+    wchar_t *src_path;  // Use wide char to support Unicode
     wchar_t *dst_path;
     CopyMode mode;
     double size_mib;
     double duration;
     double speed;
-    uint64_t test_file_size;  // 添加测试文件大小参数
+    uint64_t test_file_size;  // Add test file size parameter
 } CopyTask;
 
 // Constants definition
@@ -207,7 +207,7 @@ static int copy_using_direct_io(const wchar_t *src, const wchar_t *dst, size_t f
     while (remaining > 0) {
         size_t to_read = (remaining < MAX_READ_SIZE) ? remaining : MAX_READ_SIZE;
         to_read = (to_read / BLOCK_SIZE) * BLOCK_SIZE;  // Align to block size
-        DWORD bytes_to_read = (to_read > MAXDWORD) ? MAXDWORD : (DWORD)to_read;  // 显式转换为 DWORD
+        DWORD bytes_to_read = (to_read > MAXDWORD) ? MAXDWORD : (DWORD)to_read;  // Explicit cast to DWORD
 
         if (!ReadFile(src_handle, buffer, bytes_to_read, &bytes_read, NULL) || bytes_read == 0) break;
         if (!WriteFile(dst_handle, buffer, bytes_read, &bytes_written, NULL) || bytes_written != bytes_read) break;
@@ -320,7 +320,7 @@ static int generate_test_file(const wchar_t *path, uint64_t size) {
     DWORD bytes_written;
     uint64_t remaining = size;
     while (remaining > 0) {
-        DWORD to_write = (remaining < 512) ? (DWORD)remaining : 512;  // 显式转换为 DWORD
+        DWORD to_write = (remaining < 512) ? (DWORD)remaining : 512;  // Explicit cast to DWORD
         if (!WriteFile(file_handle, buffer, to_write, &bytes_written, NULL) || bytes_written != to_write) {
             _aligned_free(buffer);
             CloseHandle(file_handle);
@@ -339,12 +339,12 @@ DWORD WINAPI copy_file_thread(LPVOID arg) {
     CopyTask *task = (CopyTask *)arg;
     double start_time = get_time();
 
-    // 对于生成测试文件的模式，直接调用generate_test_file
+    // For generate test files mode, directly call generate_test_file
     if (task->mode == GENERATE_TEST_FILES) {
         return generate_test_file(task->src_path, task->test_file_size);
     }
 
-    // 获取文件大小
+    // Get file size
     WIN32_FILE_ATTRIBUTE_DATA attr_data;
     if (!GetFileAttributesExW(task->src_path, GetFileExInfoStandard, &attr_data)) {
         return GetLastError();
@@ -355,7 +355,7 @@ DWORD WINAPI copy_file_thread(LPVOID arg) {
     file_size.LowPart = attr_data.nFileSizeLow;
     task->size_mib = file_size.QuadPart / (1024.0 * 1024.0);
 
-    // 根据模式执行复制
+    // Execute copy based on mode
     int result = -1;
     switch (task->mode) {
         case SYSTEM_CP:
@@ -372,7 +372,7 @@ DWORD WINAPI copy_file_thread(LPVOID arg) {
             break;
     }
 
-    // 计算持续时间和速度
+    // Calculate duration and speed
     task->duration = get_time() - start_time;
     task->speed = task->size_mib / task->duration;
 
@@ -475,110 +475,198 @@ static int handle_benchmark(int argc, wchar_t *argv[]) {
         swprintf(gen_tasks[i].src_path, wcslen(from_dir) + 32, L"%s\\test_file_%d", from_dir, i + 1);
         gen_tasks[i].mode = GENERATE_TEST_FILES;
         gen_tasks[i].test_file_size = file_size;
-        
-        gen_threads[i] = CreateThread(
-            NULL,                   // 默认安全属性
-            0,                      // 默认堆栈大小
-            copy_file_thread,       // 线程函数
-            &gen_tasks[i],         // 线程函数参数
-            0,                      // 默认创建标志
-            NULL                    // 不接收线程ID
+    }
+
+    // Create thread array
+    HANDLE *active_handles = malloc(sizeof(HANDLE) * num_files);
+
+    // Start all threads
+    for (int i = 0; i < num_files; i++) {
+        active_handles[i] = CreateThread(
+            NULL,
+            0,
+            copy_file_thread,
+            &gen_tasks[i],
+            0,
+            NULL
         );
 
-        if (gen_threads[i] == NULL) {
+        if (active_handles[i] == NULL) {
             wprintf(L"Failed to create generation thread %d\n", i);
-            // 清理已创建的线程和资源
-            for (int j = 0; j < i; j++) {
-                CloseHandle(gen_threads[j]);
-                free(gen_tasks[j].src_path);
-            }
-            free(gen_tasks);
-            free(gen_threads);
             return 1;
         }
     }
-    
-    // 等待所有生成线程完成
+
+    // Wait for all threads to complete and check results
+    DWORD wait_result = WaitForMultipleObjects(
+        num_files,
+        active_handles,
+        TRUE,  // Wait for all objects
+        INFINITE
+    );
+
+    // Check wait result
+    if (wait_result == WAIT_FAILED) {
+        wprintf(L"Failed to wait for threads: %lu\n", GetLastError());
+        return 1;
+    }
+
+    // Check execution result of each thread
     bool all_success = true;
     for (int i = 0; i < num_files; i++) {
-        DWORD result;
-        WaitForSingleObject(gen_threads[i], INFINITE);
-        GetExitCodeThread(gen_threads[i], &result);
-        if (result != 0) {
+        DWORD exit_code;
+        if (GetExitCodeThread(active_handles[i], &exit_code)) {
+            if (exit_code != 0) {
+                wprintf(L"Thread %d failed with error code: %lu\n", i, exit_code);
+                all_success = false;
+            }
+        } else {
+            wprintf(L"Failed to get exit code for thread %d: %lu\n", i, GetLastError());
             all_success = false;
-            wprintf(L"Failed to generate test file %d\n", i + 1);
         }
-        CloseHandle(gen_threads[i]);
-        // 添加进度显示
-        wprintf(L"\rGenerating test files: %d/%d completed", i + 1, num_files);
-        fflush(stdout);
+        CloseHandle(active_handles[i]);
     }
-    wprintf(L"\nAll test files generated successfully!\n");
-    fflush(stdout);
+    free(active_handles);
 
     if (!all_success) {
-        // 清理资源并返回错误
+        // Clean up resources
         for (int i = 0; i < num_files; i++) {
             free(gen_tasks[i].src_path);
         }
         free(gen_tasks);
-        free(gen_threads);
         return 1;
     }
 
     // Prepare benchmark results array
     BenchmarkResult *results = malloc(sizeof(BenchmarkResult) * num_files);
-    
+    if (!results) {
+        wprintf(L"Failed to allocate memory for results\n");
+        return 1;
+    }
+
     // Run memory impact tests using existing function
     wprintf(L"\nStarting memory copy tests...\n");
     fflush(stdout);
+
+    HANDLE *threads = malloc(sizeof(HANDLE) * num_files);  // Allocate memory for thread handles
+
+    if (!threads) {
+        wprintf(L"Failed to allocate memory for thread handles\n");
+        return 1;
+    }
+
+
+    CopyTask *tasks = malloc(sizeof(CopyTask) * num_files);
+    if (!tasks) {
+        free(threads);
+        wprintf(L"Failed to allocate memory for tasks\n");
+        return 1;
+    }
+
+
+    // Create all tasks
     for (int i = 0; i < num_files; i++) {
-        CopyTask task = {0};  // 初始化为0
-        wchar_t src_path[MAX_PATH];
-        wchar_t dst_path[MAX_PATH];
+        tasks[i].src_path = malloc(sizeof(wchar_t) * MAX_PATH);
+        tasks[i].dst_path = malloc(sizeof(wchar_t) * MAX_PATH);
+
         
-        swprintf(src_path, MAX_PATH, L"%s\\test_file_%d", from_dir, i + 1);
-        swprintf(dst_path, MAX_PATH, L"%s\\test_file_%d", to_dir, i + 1);
-        
-        task.src_path = src_path;
-        task.dst_path = dst_path;
-        task.mode = DIRECT_IO_MEMORY_IMPACT;
-        
-        HANDLE thread = CreateThread(NULL, 0, copy_file_thread, &task, 0, NULL);
-        if (thread) {
-            WaitForSingleObject(thread, INFINITE);
-            CloseHandle(thread);
+        if (!tasks[i].src_path || !tasks[i].dst_path) {
+            // Clean up allocated resources
+            for (int j = 0; j < i; j++) {
+                free(tasks[j].src_path);
+                free(tasks[j].dst_path);
+            }
+            free(tasks);
+            free(threads);
+            wprintf(L"Failed to allocate memory for paths\n");
+            return 1;
         }
 
-        results[i].filename = _wcsdup(task.src_path);
-        results[i].size_mib = task.size_mib;
-        results[i].memory_duration = task.duration;
-        results[i].memory_speed = task.speed;
+        
+        swprintf(tasks[i].src_path, MAX_PATH, L"%s\\test_file_%d", from_dir, i + 1);
+        swprintf(tasks[i].dst_path, MAX_PATH, L"%s\\test_file_%d", to_dir, i + 1);
+        tasks[i].mode = DIRECT_IO_MEMORY_IMPACT;
+        
+        threads[i] = CreateThread(NULL, 0, copy_file_thread, &tasks[i], 0, NULL);
+
+        if (threads[i] == NULL) {
+            // Clean up resources
+            for (int j = 0; j <= i; j++) {
+                free(tasks[j].src_path);
+                free(tasks[j].dst_path);
+            }
+            free(tasks);
+            free(threads);
+            wprintf(L"Failed to create thread %d\n", i);
+            return 1;
+        }
+
     }
+
+    // Wait for all threads to complete
+    WaitForMultipleObjects(num_files, threads, TRUE, INFINITE);
+
+    // Collect results and clean up
+    for (int i = 0; i < num_files; i++) {
+        // Retrieve results from each task
+        CopyTask *task;
+        
+        GetExitCodeThread(threads[i], (LPDWORD)&task);
+        results[i].filename = _wcsdup(tasks[i].src_path);
+        results[i].size_mib = tasks[i].size_mib;
+        results[i].memory_duration = tasks[i].duration;
+        results[i].memory_speed = tasks[i].speed;
+        // Clean up
+        CloseHandle(threads[i]);
+        free(tasks[i].src_path);
+        free(tasks[i].dst_path);
+
+    }
+    free(tasks);
+    free(threads);
 
     // Run disk copy tests using direct_io mode
     wprintf(L"\nRunning disk copy tests...\n");
+    
+    // Create task and thread arrays
+    CopyTask *disk_tasks = malloc(sizeof(CopyTask) * num_files);
+    HANDLE *disk_threads = malloc(sizeof(HANDLE) * num_files);
+    
+    // Start all threads in parallel
     for (int i = 0; i < num_files; i++) {
-        CopyTask task = {0};  // 初始化为0
-        wchar_t src_path[MAX_PATH];
-        wchar_t dst_path[MAX_PATH];
+        // Allocate path memory for each task
+        disk_tasks[i].src_path = malloc(sizeof(wchar_t) * MAX_PATH);
+        disk_tasks[i].dst_path = malloc(sizeof(wchar_t) * MAX_PATH);
         
-        swprintf(src_path, MAX_PATH, L"%s\\test_file_%d", from_dir, i + 1);
-        swprintf(dst_path, MAX_PATH, L"%s\\test_file_%d_disk", to_dir, i + 1);
+        swprintf(disk_tasks[i].src_path, MAX_PATH, L"%s\\test_file_%d", from_dir, i + 1);
+        swprintf(disk_tasks[i].dst_path, MAX_PATH, L"%s\\test_file_%d_disk", to_dir, i + 1);
         
-        task.src_path = src_path;
-        task.dst_path = dst_path;
-        task.mode = DIRECT_IO;
+        disk_tasks[i].mode = DIRECT_IO;
         
-        HANDLE thread = CreateThread(NULL, 0, copy_file_thread, &task, 0, NULL);
-        if (thread) {
-            WaitForSingleObject(thread, INFINITE);
-            CloseHandle(thread);
+        disk_threads[i] = CreateThread(NULL, 0, copy_file_thread, &disk_tasks[i], 0, NULL);
+        if (!disk_threads[i]) {
+            wprintf(L"Failed to create disk copy thread %d\n", i);
+            // Error handling...
         }
-
-        results[i].disk_duration = task.duration;
-        results[i].disk_speed = task.speed;
     }
+
+    // Wait for all threads to complete
+    WaitForMultipleObjects(num_files, disk_threads, TRUE, INFINITE);
+
+    // Collect results and clean up
+    for (int i = 0; i < num_files; i++) {
+        results[i].disk_duration = disk_tasks[i].duration;
+        results[i].disk_speed = disk_tasks[i].speed;
+        
+        // Clean up resources
+        CloseHandle(disk_threads[i]);
+        free(disk_tasks[i].src_path);
+        free(disk_tasks[i].dst_path);
+    }
+
+    // Free array memory
+    free(disk_tasks);
+    free(disk_threads);
 
     // Calculate total statistics
     double total_size = 0, total_memory_duration = 0, total_disk_duration = 0;
@@ -607,9 +695,9 @@ static int handle_benchmark(int argc, wchar_t *argv[]) {
 
     wprintf(L"\nTotal Statistics:\n");
     wprintf(L"Total Size: %.2f MiB\n", total_size);
-    wprintf(L"Memory Copy - Total Duration: %.2f seconds, Average Speed: %.2f MiB/s\n",
+    wprintf(L"Memory Copy - Total Duration: %.2f seconds, Total Speed: %.2f MiB/s\n",
            total_memory_duration, avg_memory_speed);
-    wprintf(L"Disk Copy   - Total Duration: %.2f seconds, Average Speed: %.2f MiB/s\n",
+    wprintf(L"Disk Copy   - Total Duration: %.2f seconds, Total Speed: %.2f MiB/s\n",
            total_disk_duration, avg_disk_speed);
 
     double speed_ratio = avg_disk_speed / avg_memory_speed;
@@ -626,7 +714,7 @@ static int handle_benchmark(int argc, wchar_t *argv[]) {
     return 0;
 }
 
-// 处理生成测试文��模式
+// Handle generate test files mode
 static int handle_generate_test_files(int argc, wchar_t *argv[]) {
     if (argc < 7) {
         wprintf(L"Missing parameters for generate_test_files mode\n");
@@ -635,9 +723,9 @@ static int handle_generate_test_files(int argc, wchar_t *argv[]) {
     
     uint64_t file_size = 0;
     int num_files = 0;
-    wchar_t *output_dir = L".";  // 默认为当前目录
+    wchar_t *output_dir = L".";  // Default to current directory
     
-    // 解析参数
+    // Parse arguments
     for (int i = 3; i < argc; i += 2) {
         if (wcscmp(argv[i], L"--size") == 0) {
             file_size = parse_size_with_unit(argv[i+1]);
@@ -653,7 +741,7 @@ static int handle_generate_test_files(int argc, wchar_t *argv[]) {
         return 1;
     }
     
-    // 创建并执行生成任务
+    // Create and execute generation tasks
     CopyTask *tasks = malloc(sizeof(CopyTask) * num_files);
     HANDLE *threads = malloc(sizeof(HANDLE) * num_files);
     
@@ -667,17 +755,17 @@ static int handle_generate_test_files(int argc, wchar_t *argv[]) {
         tasks[i].test_file_size = file_size;
         
         threads[i] = CreateThread(
-            NULL,                   // 默认安全属性
-            0,                      // 默认堆栈大小
-            copy_file_thread,       // 线程函数
-            &tasks[i],             // 线程函数参数
-            0,                      // 默认创建标志
-            NULL                    // 不接收线程ID
+            NULL,                   // Default security attributes
+            0,                      // Default stack size
+            copy_file_thread,       // Thread function
+            &tasks[i],              // Thread function argument
+            0,                      // Default creation flags
+            NULL                    // Do not receive thread ID
         );
         
         if (threads[i] == NULL) {
             wprintf(L"Failed to create thread %d\n", i);
-            // 清理已创建的线程和资源
+            // Clean up already created threads and resources
             for (int j = 0; j < i; j++) {
                 CloseHandle(threads[j]);
                 free(tasks[j].src_path);
@@ -688,7 +776,7 @@ static int handle_generate_test_files(int argc, wchar_t *argv[]) {
         }
     }
     
-    // 等待所有线程完成
+    // Wait for all threads to complete
     bool all_success = true;
     for (int i = 0; i < num_files; i++) {
         DWORD result;
@@ -700,7 +788,7 @@ static int handle_generate_test_files(int argc, wchar_t *argv[]) {
         CloseHandle(threads[i]);
     }
     
-    // 打印结果
+    // Print results
     wprintf(L"\nGeneration Results:\n");
     wprintf(L"%-10s %-30s %-15s %-12s\n", 
            L"File #", L"Path", L"Size", L"Duration (s)");
@@ -721,12 +809,14 @@ static int handle_generate_test_files(int argc, wchar_t *argv[]) {
     wprintf(L"Average Speed: %.2f MiB/s\n", 
            (file_size * num_files) / (1024.0 * 1024.0) / total_duration);
     
-    // 清理资源
+    // Clean up resources
     for (int i = 0; i < num_files; i++) {
         free(tasks[i].src_path);
     }
     free(tasks);
     free(threads);
+    fflush(stdout);
+
     
     return all_success ? 0 : 1;
 }
@@ -763,6 +853,8 @@ static void print_copy_results(CopyTask *tasks, int num_files) {
     wprintf(L"Total Size: %.2f MiB\n", total_size);
     wprintf(L"Total Duration: %.2f seconds\n", total_duration);
     wprintf(L"Average Speed: %.2f MiB/s\n", total_size / total_duration);
+    fflush(stdout);
+
 }
 
 // Handle file copy mode
@@ -772,14 +864,14 @@ static int handle_copy_files(int argc, wchar_t *argv[], CopyMode mode) {
         return 1;
     }
 
-    // 查找--from和--to参数
+    // Find --from and --to parameters
     wchar_t **src_files = NULL;
     wchar_t *dst_dir = NULL;
     int num_files = 0;
     int from_index = -1;
     int to_index = -1;
 
-    // 首先找到 --from 和 --to 的位置
+    // Locate the positions of --from and --to
     for (int i = 3; i < argc; i++) {
         if (wcscmp(argv[i], L"--from") == 0) {
             from_index = i;
@@ -789,13 +881,13 @@ static int handle_copy_files(int argc, wchar_t *argv[], CopyMode mode) {
         }
     }
 
-    // 验证参数
+    // Validate parameters
     if (from_index == -1 || to_index == -1 || from_index >= to_index) {
         wprintf(L"Invalid parameters for copy mode\n");
         return 1;
     }
 
-    // 计算文件数量和设置源文件数组
+    // Calculate the number of files and set the source file array
     src_files = &argv[from_index + 1];
     num_files = to_index - (from_index + 1);
     dst_dir = argv[to_index + 1];
@@ -805,17 +897,17 @@ static int handle_copy_files(int argc, wchar_t *argv[], CopyMode mode) {
         return 1;
     }
 
-    // 打印调试信息
+    // Print debug information
     wprintf(L"Number of files to copy: %d\n", num_files);
     for (int i = 0; i < num_files; i++) {
         wprintf(L"File %d: %s\n", i + 1, src_files[i]);
     }
 
-    // 创建任务和线程
+    // Create tasks and threads
     CopyTask *tasks = malloc(sizeof(CopyTask) * num_files);
     HANDLE *threads = malloc(sizeof(HANDLE) * num_files);
 
-    // 启动所有复制线程
+    // Start all copy threads
     for (int i = 0; i < num_files; i++) {
         tasks[i].src_path = src_files[i];
         tasks[i].dst_path = malloc(sizeof(wchar_t) * (wcslen(dst_dir) + wcslen(wcsrchr(src_files[i], L'\\') ? 
@@ -826,17 +918,17 @@ static int handle_copy_files(int argc, wchar_t *argv[], CopyMode mode) {
         tasks[i].mode = mode;
         
         threads[i] = CreateThread(
-            NULL,                   // 默认安全属性
-            0,                      // 默认堆栈大小
-            copy_file_thread,       // 线程函数
-            &tasks[i],             // 线程函数参数
-            0,                      // 默认创建标志
-            NULL                    // 不接收线程ID
+            NULL,                   // Default security attributes
+            0,                      // Default stack size
+            copy_file_thread,       // Thread function
+            &tasks[i],              // Thread function argument
+            0,                      // Default creation flags
+            NULL                    // Do not receive thread ID
         );
 
         if (threads[i] == NULL) {
             wprintf(L"Failed to create thread %d\n", i);
-            // 清理已创建的线程和资源
+            // Clean up created threads and resources
             for (int j = 0; j < i; j++) {
                 CloseHandle(threads[j]);
                 free(tasks[j].dst_path);
@@ -847,13 +939,13 @@ static int handle_copy_files(int argc, wchar_t *argv[], CopyMode mode) {
         }
     }
 
-    // 等待所有线程完成
+    // Wait for all threads to complete
     for (int i = 0; i < num_files; i++) {
         WaitForSingleObject(threads[i], INFINITE);
         CloseHandle(threads[i]);
     }
 
-    // 打印结果并清理
+    // Print results and clean up
     print_copy_results(tasks, num_files);
 
     for (int i = 0; i < num_files; i++) {
