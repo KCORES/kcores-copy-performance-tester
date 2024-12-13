@@ -393,6 +393,30 @@ static void format_path(wchar_t *path) {
     }
 }
 
+// Helper function to parse file size with unit
+static uint64_t parse_size_with_unit(const wchar_t *size_str) {
+    uint64_t size = 0;
+    wchar_t unit;
+    
+    if (swscanf_s(size_str, L"%llu%lc", &size, &unit, 1) != 2) {
+        return 0;
+    }
+    
+    switch (towupper(unit)) {
+        case L'T':
+            size *= 1024;
+        case L'G':
+            size *= 1024;
+        case L'M':
+            size *= 1024 * 1024;
+            break;
+        default:
+            return 0;
+    }
+    
+    return size;
+}
+
 // New function to handle benchmark mode
 static int handle_benchmark(int argc, wchar_t *argv[]) {
     uint64_t file_size = 0;
@@ -403,9 +427,9 @@ static int handle_benchmark(int argc, wchar_t *argv[]) {
     // Parse arguments
     for (int i = 3; i < argc; i += 2) {
         if (wcscmp(argv[i], L"--size") == 0) {
-            file_size = _wtoi64(argv[i+1]);
+            file_size = parse_size_with_unit(argv[i+1]);
         } else if (wcscmp(argv[i], L"--num") == 0) {
-            num_files = _wtoi(argv[i+1]);
+            num_files = (int)wcstol(argv[i+1], NULL, 10);
         } else if (wcscmp(argv[i], L"--from") == 0) {
             from_dir = argv[i+1];
         } else if (wcscmp(argv[i], L"--to") == 0) {
@@ -475,7 +499,12 @@ static int handle_benchmark(int argc, wchar_t *argv[]) {
             wprintf(L"Failed to generate test file %d\n", i + 1);
         }
         CloseHandle(gen_threads[i]);
+        // 添加进度显示
+        wprintf(L"\rGenerating test files: %d/%d completed", i + 1, num_files);
+        fflush(stdout);
     }
+    wprintf(L"\nAll test files generated successfully!\n");
+    fflush(stdout);
 
     if (!all_success) {
         // 清理资源并返回错误
@@ -491,7 +520,8 @@ static int handle_benchmark(int argc, wchar_t *argv[]) {
     BenchmarkResult *results = malloc(sizeof(BenchmarkResult) * num_files);
     
     // Run memory impact tests using existing function
-    wprintf(L"\nRunning memory copy tests...\n");
+    wprintf(L"\nStarting memory copy tests...\n");
+    fflush(stdout);
     for (int i = 0; i < num_files; i++) {
         CopyTask task = {0};  // 初始化为0
         wchar_t src_path[MAX_PATH];
@@ -600,24 +630,9 @@ static int handle_generate_test_files(int argc, wchar_t *argv[]) {
     // 解析参数
     for (int i = 3; i < argc; i += 2) {
         if (wcscmp(argv[i], L"--size") == 0) {
-            wchar_t unit;
-            if (swscanf_s(argv[i+1], L"%llu%lc", &file_size, &unit, 1) != 2) {
-                return 0;
-            }
-            
-            switch (towupper(unit)) {
-                case L'T':
-                    file_size *= 1024;
-                case L'G':
-                    file_size *= 1024;
-                case L'M':
-                    file_size *= 1024 * 1024;
-                    break;
-                default:
-                    return 0;
-            }
+            file_size = parse_size_with_unit(argv[i+1]);
         } else if (wcscmp(argv[i], L"--num") == 0) {
-            num_files = (int)wcstol(argv[i+1], NULL, 10);  // 使用 wcstol 替代 _wtoi
+            num_files = (int)wcstol(argv[i+1], NULL, 10);
         } else if (wcscmp(argv[i], L"--dir") == 0) {
             output_dir = argv[i+1];
         }
