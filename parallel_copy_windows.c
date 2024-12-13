@@ -112,6 +112,16 @@ static int copy_using_mmap(const wchar_t *src, const wchar_t *dst, size_t file_s
         return GetLastError();
     }
 
+    // Set the size of destination file first
+    LARGE_INTEGER li;
+    li.QuadPart = file_size;
+    if (!SetFilePointerEx(dst_handle, li, NULL, FILE_BEGIN) ||
+        !SetEndOfFile(dst_handle)) {
+        CloseHandle(src_handle);
+        CloseHandle(dst_handle);
+        return GetLastError();
+    }
+
     int result = 0;
     size_t remaining = file_size;
     size_t offset = 0;
@@ -119,19 +129,19 @@ static int copy_using_mmap(const wchar_t *src, const wchar_t *dst, size_t file_s
     while (remaining > 0 && result == 0) {
         size_t chunk_size = (remaining < MMAP_CHUNK_SIZE) ? remaining : MMAP_CHUNK_SIZE;
 
-        // Create file mappings
+        // Create file mappings with proper size parameters
         HANDLE src_map = CreateFileMappingW(src_handle, 
             NULL, 
             PAGE_READONLY, 
-            0, 
-            0, 
+            (DWORD)(file_size >> 32),
+            (DWORD)file_size,
             NULL);
 
         HANDLE dst_map = CreateFileMappingW(dst_handle,
             NULL,
             PAGE_READWRITE,
-            0,
-            file_size,
+            (DWORD)(file_size >> 32),
+            (DWORD)file_size,
             NULL);
 
         if (src_map == NULL || dst_map == NULL) {
@@ -139,18 +149,18 @@ static int copy_using_mmap(const wchar_t *src, const wchar_t *dst, size_t file_s
             break;
         }
 
-        // Map views
+        // Map views with correct offset
         LPVOID src_view = MapViewOfFile(src_map,
             FILE_MAP_READ,
             (DWORD)(offset >> 32),
             (DWORD)offset,
-            (chunk_size > MAXDWORD) ? MAXDWORD : (DWORD)chunk_size);
+            chunk_size);
 
         LPVOID dst_view = MapViewOfFile(dst_map,
             FILE_MAP_WRITE,
             (DWORD)(offset >> 32),
             (DWORD)offset,
-            (chunk_size > MAXDWORD) ? MAXDWORD : (DWORD)chunk_size);
+            chunk_size);
 
         if (src_view == NULL || dst_view == NULL) {
             result = GetLastError();
@@ -616,7 +626,7 @@ static int handle_benchmark(int argc, wchar_t *argv[]) {
     return 0;
 }
 
-// 处理生成测试文件模式
+// 处理生成测试文��模式
 static int handle_generate_test_files(int argc, wchar_t *argv[]) {
     if (argc < 7) {
         wprintf(L"Missing parameters for generate_test_files mode\n");
