@@ -77,10 +77,15 @@ static void fill_buffer_with_random_data(RandomGenerator *gen, void *buffer, siz
     MemoryBarrier();
 }
 
-// System copy function using Windows API
+// System copy function using Windows API with CopyFile2
 static int copy_using_system_cp(const wchar_t *src, const wchar_t *dst) {
-    if (!CopyFileW(src, dst, FALSE)) {
-        return GetLastError();
+    COPYFILE2_EXTENDED_PARAMETERS params = {0};
+    params.dwSize = sizeof(COPYFILE2_EXTENDED_PARAMETERS);
+    params.dwCopyFlags = 0; // You can set specific flags here if needed
+
+    HRESULT result = CopyFile2(src, dst, &params);
+    if (FAILED(result)) {
+        return HRESULT_CODE(result);
     }
     return 0;
 }
